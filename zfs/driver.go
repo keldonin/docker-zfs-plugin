@@ -1,7 +1,7 @@
 package zfsdriver
 
 import (
-	"fmt"
+	"errors"
 	"time"
 
 	"github.com/clinta/go-zfs"
@@ -12,33 +12,51 @@ import (
 //ZfsDriver implements the plugin helpers volume.Driver interface for zfs
 type ZfsDriver struct {
 	volume.Driver
-	rds []*zfs.Dataset //root dataset
+
+	//The volumes the plugin is tracking, use empty struct as value to mimic a set
+	volumes   map[string]struct{}
 }
 
 //NewZfsDriver returns the plugin driver object
-func NewZfsDriver(dss ...string) (*ZfsDriver, error) {
+func NewZfsDriver(rootDatasets ...string) (*ZfsDriver, error) {
 	log.Debug("Creating new ZfsDriver.")
-	zd := &ZfsDriver{}
+
 	if len(dss) < 1 {
 		return nil, fmt.Errorf("No datasets specified")
 	}
-	for _, ds := range dss {
-		if !zfs.DatasetExists(ds) {
-			_, err := zfs.CreateDatasetRecursive(ds, make(map[string]string))
-			if err != nil {
-				log.Error("Failed to create root dataset.")
-				return nil, err
-			}
-		}
-		rds, err := zfs.GetDataset(ds)
-		if err != nil {
-			log.Error("Failed to get root dataset.")
-			return nil, err
-		}
-		zd.rds = append(zd.rds, rds)
+
+	zd := &ZfsDriver{
+		volumes: map[string]struct{}{},
+	}
+
+	//Load any datasets under a tracked root dataset
+	err := zd.loadDatasetState(rootDatasets)
+	if err != nil {
+		return nil, err
 	}
 
 	return zd, nil
+}
+
+func (zd *ZfsDriver) loadDatasetState(rootDatasets []string) (error) {
+	for _, rdsn := range rootDatasets {
+		rds, err := zfs.GetDataset(rdsn)
+		if err != nil {
+			log.WithField("RootDatasetName", rdsn).Error("Failed to get root dataset")
+			continue
+		}
+
+		dsl, err := rds.DatasetList()
+		if err != nil {
+			return err
+		}
+
+		for _, ds := range dsl {
+			zd.volumes[ds.Name] = struct{}{}
+		}
+	}
+
+	return nil
 }
 
 //Create creates a new zfs dataset for a volume
@@ -46,10 +64,16 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 	log.WithField("Request", req).Debug("Create")
 
 	if zfs.DatasetExists(req.Name) {
-		return fmt.Errorf("volume already exists")
+		return errors.New("Volume already exists")
 	}
 
 	_, err := zfs.CreateDatasetRecursive(req.Name, req.Options)
+	if err != nil {
+		return err
+	}
+
+	zd.volumes[req.Name] = struct{}{}
+
 	return err
 }
 
@@ -58,22 +82,13 @@ func (zd *ZfsDriver) List() (*volume.ListResponse, error) {
 	log.Debug("List")
 	var vols []*volume.Volume
 
-	for _, rds := range zd.rds {
-		dsl, err := rds.DatasetList()
+	for dsn, _ := range zd.volumes {
+		vol, err := zd.getVolume(dsn)
 		if err != nil {
-			return nil, err
+			log.WithField("DatasetName", dsn).Error("Failed to get dataset info")
+			continue
 		}
-		for _, ds := range dsl {
-			//TODO: rewrite this to utilize zd.getVolume() when
-			//upstream go-zfs is rewritten to cache properties
-			var mp string
-			mp, err = ds.GetMountpoint()
-			if err != nil {
-				log.WithField("name", ds.Name).Error("Failed to get mountpoint from dataset")
-				continue
-			}
-			vols = append(vols, &volume.Volume{Name: ds.Name, Mountpoint: mp})
-		}
+		vols = append(vols, vol)
 	}
 
 	return &volume.ListResponse{Volumes: vols}, nil
@@ -130,7 +145,15 @@ func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 		return err
 	}
 
-	return ds.Destroy()
+
+	err = ds.Destroy()
+	if err != nil {
+		return err
+	}
+
+	delete(zd.volumes, req.Name)
+
+	return nil
 }
 
 //Path returns the mountpoint of a volume
