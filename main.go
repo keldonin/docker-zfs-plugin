@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -14,55 +14,21 @@ import (
 	"github.com/coreos/go-systemd/activation"
 	"github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
 )
 
-const (
-	version         = "1.0.4"
-	shutdownTimeout = 10 * time.Second
-)
+const shutdownTimeout = 10 * time.Second
 
 func main() {
+	debug := os.Getenv("DEBUG")
+	if ok, _ := strconv.ParseBool(debug); ok {
+		log.SetLevel(log.DebugLevel)
+	}
 
-	verbose := false
-	app := cli.NewApp()
-	app.Name = "docker-zfs-plugin"
-	app.Usage = "Docker ZFS Plugin"
-	app.Version = version
-	app.Flags = []cli.Flag{
-		cli.StringSliceFlag{
-			Name:  "dataset-name",
-			Usage: "Name of the ZFS dataset to be used. It will be created if it doesn't exist.",
-		},
-		cli.BoolFlag{
-			Name:        "verbose",
-			Usage:       "verbose output",
-			Destination: &verbose,
-		},
-	}
-	app.Action = Run
-	app.Before = func(c *cli.Context) error {
-		if verbose {
-			log.SetLevel(log.DebugLevel)
-		}
-		return nil
-	}
-	err := app.Run(os.Args)
+	d, err := zfsdriver.NewZfsDriver()
 	if err != nil {
 		panic(err)
 	}
-}
 
-// Run runs the driver
-func Run(ctx *cli.Context) error {
-	if ctx.String("dataset-name") == "" {
-		return fmt.Errorf("zfs dataset name is a required field")
-	}
-
-	d, err := zfsdriver.NewZfsDriver(ctx.StringSlice("dataset-name")...)
-	if err != nil {
-		return err
-	}
 	h := volume.NewHandler(d)
 	errCh := make(chan error)
 
@@ -72,7 +38,7 @@ func Run(ctx *cli.Context) error {
 	}
 	if len(listeners) == 0 {
 		log.Debug("launching volume handler.")
-		go func() { errCh <- h.ServeUnix("zfs", 0) }()
+		go func() { errCh <- h.ServeUnix("zfs-v2", 0) }()
 	} else {
 		l := listeners[0]
 		log.WithField("listener", l.Addr().String()).Debug("launching volume handler")
@@ -102,6 +68,4 @@ func Run(ctx *cli.Context) error {
 		err = hErr
 		log.WithError(err).Error("error in handler after shutdown")
 	}
-
-	return err
 }

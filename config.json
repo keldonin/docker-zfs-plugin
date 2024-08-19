@@ -1,0 +1,58 @@
+{
+  "description": "ZFS plugin for Docker",
+  "documentation": "https://docs.docker.com/engine/extend/plugins/",
+  "entrypoint": [
+    "/docker-zfs-plugin"
+  ],
+  "env": [
+    {
+      "name": "DEBUG",
+      "settable": [
+        "value"
+      ],
+      "value": "0"
+    }
+  ],
+  "interface": {
+    "socket": "zfs-v2.sock",
+    "types": [
+      "docker.volumedriver/1.0"
+    ]
+  },
+  "linux": {
+    "capabilities": [
+      "CAP_SYS_ADMIN"
+    ],
+    "devices": [
+      {
+        "path": "/dev/zfs"
+      }
+    ]
+  },
+  "mounts": [
+    {
+      "destination": "/mnt/",
+      "options": [
+        "rbind"
+      ],
+      "name": "state",
+      "source": "/var/lib/docker/plugins/",
+      "settable": [
+        "source"
+      ],
+      "type": "bind"
+    },
+    {
+      "destination": "/var/lib/docker/volumes/",
+      "options": [
+        "rbind",
+        "rshared",
+        "rw"
+      ],
+      "name": "volumes",
+      "source": "/var/lib/docker/volumes/",
+      "type": "bind"
+    }
+  ],
+  "propagatedmount": "/var/lib/docker/plugins/pluginHash/propagated-mount/"
+}
