@@ -1,3 +1,10 @@
 vendor
 bin/docker-zfs-plugin
 plugin
+/.vscode/
+
+# emacs backup files
+*~
+
+# build artifacts
+/docker-zfs-plugin
