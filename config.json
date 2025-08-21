@@ -11,6 +11,19 @@
         "value"
       ],
       "value": "1"
+    },
+    {
+      "name": "ZFS_PARENT_DATASET",
+      "settable": [
+        "value"
+      ]
+    },
+    {
+      "name": "ZFS_SHOW_FULL_DATASET",
+      "settable": [
+        "value"
+      ],
+      "value": "0"
     }
   ],
   "interface": {

@@ -3,23 +3,24 @@ package zfsdriver
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 	"os"
+	"strings"
 	"time"
+
 	"github.com/clinta/go-zfs"
 	"github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
 )
 
-//ZfsDriver implements the plugin helpers volume.Driver interface for zfs
+// ZfsDriver implements the plugin helpers volume.Driver interface for zfs
 type ZfsDriver struct {
 	volume.Driver
 
 	//The volumes the plugin is tracking, use empty struct as value to mimic a set
-	volumes   map[string]struct{}
+	volumes map[string]struct{}
 }
 
-//Where to save the stored volumes/metadata
+// Where to save the stored volumes/metadata
 const (
 	statePath = "/mnt/zfs-v2-state.json"
 	//This is some top-tier garbage code, but the v2 plugin infrastructure always re-scopes any returned mount paths for the
@@ -37,7 +38,90 @@ const (
 	volumeBase = "/var/lib/docker/volumes/"
 )
 
-//NewZfsDriver returns the plugin driver object
+// isSimpleVolumeName checks if the volume name is simple (no '/' characters)
+// indicating it should use the parent dataset prefix
+func isSimpleVolumeName(name string) bool {
+	return !strings.Contains(name, "/")
+}
+
+// getZfsParentDataset retrieves the ZFS_PARENT_DATASET environment variable
+func getZfsParentDataset() (string, error) {
+	parentDataset := os.Getenv("ZFS_PARENT_DATASET")
+	if parentDataset == "" {
+		return "", errors.New("ZFS_PARENT_DATASET environment variable is not set")
+	}
+	return parentDataset, nil
+}
+
+// buildDatasetName constructs the full dataset name based on the volume name
+func buildDatasetName(volumeName string) (string, error) {
+	if isSimpleVolumeName(volumeName) {
+		parentDataset, err := getZfsParentDataset()
+		if err != nil {
+			return "", err
+		}
+		return parentDataset + "/" + volumeName, nil
+	}
+	return volumeName, nil
+}
+
+// extractVolumeName extracts the volume name for display from a dataset name
+// taking into account ZFS_SHOW_FULL_DATASET setting
+func extractVolumeName(datasetName string) string {
+	showFull := os.Getenv("ZFS_SHOW_FULL_DATASET")
+	if showFull == "1" {
+		return datasetName
+	}
+
+	parentDataset := os.Getenv("ZFS_PARENT_DATASET")
+	if parentDataset != "" && strings.HasPrefix(datasetName, parentDataset+"/") {
+		return strings.TrimPrefix(datasetName, parentDataset+"/")
+	}
+	return datasetName
+}
+
+// getDisplayName returns the appropriate display name for a volume
+func getDisplayName(volumeName string) (string, error) {
+	// First, get the actual dataset name
+	datasetName, err := buildDatasetName(volumeName)
+	if err != nil {
+		return volumeName, err // fallback to original name if we can't build dataset name
+	}
+
+	// Then apply display logic based on ZFS_SHOW_FULL_DATASET
+	return extractVolumeName(datasetName), nil
+}
+
+// volumeExistsInState checks if a volume already exists in our internal state
+// considering both short and long names to prevent duplicates
+func (zd *ZfsDriver) volumeExistsInState(volumeName string) bool {
+	// Check if volume exists with the exact name
+	if _, exists := zd.volumes[volumeName]; exists {
+		return true
+	}
+
+	// If it's a simple name, check if the full dataset name exists
+	if isSimpleVolumeName(volumeName) {
+		if parentDataset := os.Getenv("ZFS_PARENT_DATASET"); parentDataset != "" {
+			fullName := parentDataset + "/" + volumeName
+			if _, exists := zd.volumes[fullName]; exists {
+				return true
+			}
+		}
+	} else {
+		// If it's a full name, check if the short name exists
+		shortName := extractVolumeName(volumeName)
+		if shortName != volumeName {
+			if _, exists := zd.volumes[shortName]; exists {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// NewZfsDriver returns the plugin driver object
 func NewZfsDriver() (*ZfsDriver, error) {
 	log.Debug("Creating new ZfsDriver.")
 	zd := &ZfsDriver{
@@ -53,7 +137,7 @@ func NewZfsDriver() (*ZfsDriver, error) {
 	return zd, nil
 }
 
-func (zd *ZfsDriver) loadDatasetState() (error) {
+func (zd *ZfsDriver) loadDatasetState() error {
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -81,11 +165,22 @@ func (zd *ZfsDriver) saveDatasetState() {
 	}
 }
 
-//Create creates a new zfs dataset for a volume
+// Create creates a new zfs dataset for a volume
 func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 	log.WithField("Request", req).Debug("Create")
 
-	if zfs.DatasetExists(req.Name) {
+	// Check if volume already exists in our internal state to prevent duplicates
+	if zd.volumeExistsInState(req.Name) {
+		return errors.New("volume already exists in state")
+	}
+
+	// Build the full dataset name based on whether it's a simple name or complete dataset path
+	datasetName, err := buildDatasetName(req.Name)
+	if err != nil {
+		return err
+	}
+
+	if zfs.DatasetExists(datasetName) {
 		return errors.New("volume already exists")
 	}
 
@@ -100,16 +195,18 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 	}
 	mountpoint, explicit := req.Options["mountpoint"]
 	if !explicit {
-	   //If we have no explicit mountpoint the default ZFS behaviour is to use the dataset name, so mimic that here.
-	   mountpoint = req.Name
+		//If we have no explicit mountpoint the default ZFS behaviour is to use the dataset name, so mimic that here.
+		// Use the full dataset name for the mountpoint to maintain consistency across all volumes
+		mountpoint = datasetName
 	}
 	req.Options["mountpoint"] = volumeBase + strings.Trim(mountpoint, "/")
 
-	_, err := zfs.CreateDatasetRecursive(req.Name, req.Options)
+	_, err = zfs.CreateDatasetRecursive(datasetName, req.Options)
 	if err != nil {
 		return err
 	}
 
+	// Store the original volume name in our tracking map, not the full dataset name
 	zd.volumes[req.Name] = struct{}{}
 
 	zd.saveDatasetState()
@@ -117,7 +214,7 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 	return err
 }
 
-//List returns a list of zfs volumes on this host
+// List returns a list of zfs volumes on this host
 func (zd *ZfsDriver) List() (*volume.ListResponse, error) {
 	log.Debug("List")
 	var vols []*volume.Volume
@@ -134,8 +231,8 @@ func (zd *ZfsDriver) List() (*volume.ListResponse, error) {
 	return &volume.ListResponse{Volumes: vols}, nil
 }
 
-//Get returns the volume.Volume{} object for the requested volume
-//nolint: dupl
+// Get returns the volume.Volume{} object for the requested volume
+// nolint: dupl
 func (zd *ZfsDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 	log.WithField("Request", req).Debug("Get")
 
@@ -147,14 +244,20 @@ func (zd *ZfsDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 	return &volume.GetResponse{Volume: v}, nil
 }
 
-func (zd *ZfsDriver) scopeMount(mountpath string) (string) {
+func (zd *ZfsDriver) scopeMount(mountpath string) string {
 	//We just naively join them with string append rather than invoking filepath.join as that will collapse our ".." hack to
 	//get out to properly mount relative to the root filesystem.
 	return propagateBase + mountpath
 }
 
 func (zd *ZfsDriver) getVolume(name string) (*volume.Volume, error) {
-	ds, err := zfs.GetDataset(name)
+	// Build the full dataset name for ZFS operations
+	datasetName, err := buildDatasetName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	ds, err := zfs.GetDataset(datasetName)
 	if err != nil {
 		return nil, err
 	}
@@ -167,17 +270,32 @@ func (zd *ZfsDriver) getVolume(name string) (*volume.Volume, error) {
 	//Need to scope the host path for the container before returning to docker
 	mp = zd.scopeMount(mp)
 
+	// Get the appropriate display name for the volume
+	displayName, err := getDisplayName(name)
+	if err != nil {
+		log.WithError(err).Error("Failed to get display name")
+		displayName = name // fallback to original name
+	}
+
 	ts, err := ds.GetCreation()
 	if err != nil {
 		log.WithError(err).Error("Failed to get creation property from zfs dataset")
-		return &volume.Volume{Name: name, Mountpoint: mp}, nil
+		// Return the display name for the volume
+		return &volume.Volume{Name: displayName, Mountpoint: mp}, nil
 	}
 
-	return &volume.Volume{Name: name, Mountpoint: mp, CreatedAt: ts.Format(time.RFC3339)}, nil
+	// Return the display name for the volume
+	return &volume.Volume{Name: displayName, Mountpoint: mp, CreatedAt: ts.Format(time.RFC3339)}, nil
 }
 
 func (zd *ZfsDriver) getMP(name string) (string, error) {
-	ds, err := zfs.GetDataset(name)
+	// Build the full dataset name for ZFS operations
+	datasetName, err := buildDatasetName(name)
+	if err != nil {
+		return "", err
+	}
+
+	ds, err := zfs.GetDataset(datasetName)
 	if err != nil {
 		return "", err
 	}
@@ -193,21 +311,27 @@ func (zd *ZfsDriver) getMP(name string) (string, error) {
 	return mp, nil
 }
 
-//Remove destroys a zfs dataset for a volume
+// Remove destroys a zfs dataset for a volume
 func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 	log.WithField("Request", req).Debug("Remove")
 
-	ds, err := zfs.GetDataset(req.Name)
+	// Build the full dataset name for ZFS operations
+	datasetName, err := buildDatasetName(req.Name)
 	if err != nil {
 		return err
 	}
 
+	ds, err := zfs.GetDataset(datasetName)
+	if err != nil {
+		return err
+	}
 
 	err = ds.Destroy()
 	if err != nil {
 		return err
 	}
 
+	// Remove using the original volume name
 	delete(zd.volumes, req.Name)
 
 	zd.saveDatasetState()
@@ -215,8 +339,8 @@ func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 	return nil
 }
 
-//Path returns the mountpoint of a volume
-//nolint: dupl
+// Path returns the mountpoint of a volume
+// nolint: dupl
 func (zd *ZfsDriver) Path(req *volume.PathRequest) (*volume.PathResponse, error) {
 	log.WithField("Request", req).Debug("Path")
 
@@ -228,8 +352,8 @@ func (zd *ZfsDriver) Path(req *volume.PathRequest) (*volume.PathResponse, error)
 	return &volume.PathResponse{Mountpoint: mp}, nil
 }
 
-//Mount returns the mountpoint of the zfs volume
-//nolint: dupl
+// Mount returns the mountpoint of the zfs volume
+// nolint: dupl
 func (zd *ZfsDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) {
 	log.WithField("Request", req).Debug("Mount")
 	mp, err := zd.getMP(req.Name)
@@ -240,13 +364,13 @@ func (zd *ZfsDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, err
 	return &volume.MountResponse{Mountpoint: mp}, nil
 }
 
-//Unmount does nothing because a zfs dataset need not be unmounted
+// Unmount does nothing because a zfs dataset need not be unmounted
 func (zd *ZfsDriver) Unmount(req *volume.UnmountRequest) error {
 	log.WithField("Request", req).Debug("Unmount")
 	return nil
 }
 
-//Capabilities sets the scope to local as this is a local only driver
+// Capabilities sets the scope to local as this is a local only driver
 func (zd *ZfsDriver) Capabilities() *volume.CapabilitiesResponse {
 	log.Debug("Capabilities")
 	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "local"}}
