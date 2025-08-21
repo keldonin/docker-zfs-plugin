@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"strconv"
-
 	zfsdriver "github.com/keldonin/docker-zfs-plugin/zfs"
 	"github.com/coreos/go-systemd/activation"
 	"github.com/docker/go-plugins-helpers/volume"

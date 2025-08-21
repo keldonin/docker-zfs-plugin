@@ -3,11 +3,9 @@ package zfsdriver
 import (
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"strings"
 	"os"
 	"time"
-
 	"github.com/clinta/go-zfs"
 	"github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
@@ -56,7 +54,7 @@ func NewZfsDriver() (*ZfsDriver, error) {
 }
 
 func (zd *ZfsDriver) loadDatasetState() (error) {
-	data, err := ioutil.ReadFile(statePath)
+	data, err := os.ReadFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Debug("No initial state found")
@@ -78,7 +76,7 @@ func (zd *ZfsDriver) saveDatasetState() {
 		return
 	}
 
-	if err := ioutil.WriteFile(statePath, data, 0644); err != nil {
+	if err := os.WriteFile(statePath, data, 0644); err != nil {
 		log.WithField("StatePath", statePath).Error(err)
 	}
 }
@@ -88,7 +86,7 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 	log.WithField("Request", req).Debug("Create")
 
 	if zfs.DatasetExists(req.Name) {
-		return errors.New("Volume already exists")
+		return errors.New("volume already exists")
 	}
 
 	//We unfortunately have to somewhat ignore the mountpath that the user specifies as we're stuck inside a container and
@@ -124,7 +122,7 @@ func (zd *ZfsDriver) List() (*volume.ListResponse, error) {
 	log.Debug("List")
 	var vols []*volume.Volume
 
-	for dsn, _ := range zd.volumes {
+	for dsn := range zd.volumes {
 		vol, err := zd.getVolume(dsn)
 		if err != nil {
 			log.WithField("DatasetName", dsn).Error("Failed to get dataset info")
