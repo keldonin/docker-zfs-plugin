@@ -1,5 +1,5 @@
 {
-  "description": "ZFS plugin for Docker",
+  "description": "ZFS volume plugin for Docker",
   "documentation": "https://docs.docker.com/engine/extend/plugins/",
   "entrypoint": [
     "/docker-zfs-plugin"
@@ -10,7 +10,7 @@
       "settable": [
         "value"
       ],
-      "value": "0"
+      "value": "1"
     }
   ],
   "interface": {

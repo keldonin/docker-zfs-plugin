@@ -4,7 +4,7 @@ import (
 	"os"
 	"strconv"
 
-	zfsdriver "github.com/TrilliumIT/docker-zfs-plugin/zfs"
+	zfsdriver "github.com/keldonin/docker-zfs-plugin/zfs"
 	"github.com/coreos/go-systemd/activation"
 	"github.com/docker/go-plugins-helpers/volume"
 	log "github.com/sirupsen/logrus"
