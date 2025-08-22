@@ -6,24 +6,43 @@
   ],
   "env": [
     {
-      "name": "DEBUG",
+      "name": "LOGLEVEL",
+      "description": "Set the logging level (debug, info, warn, error, fatal, panic)",
       "settable": [
         "value"
       ],
-      "value": "1"
+      "value": "info"
     },
     {
       "name": "ZFS_PARENT_DATASET",
+      "description": "Set the parent dataset for ZFS volumes",
       "settable": [
         "value"
       ]
     },
     {
       "name": "ZFS_SHOW_FULL_DATASET",
+      "description": "Show the full dataset name (including parent dataset)",
       "settable": [
         "value"
       ],
-      "value": "0"
+      "value": "on"
+    },
+    {
+      "name": "ZFS_KEEP_NEW_DATASET",
+      "description": "Default docker.zfs:keep value for newly created datasets (on/off)",
+      "settable": [
+        "value"
+      ],
+      "value": "off"
+    },
+    {
+      "name": "ZFS_KEEP_EXISTING_DATASET",
+      "description": "Default docker.zfs:keep value for existing datasets being attached (on/off)",
+      "settable": [
+        "value"
+      ],
+      "value": "on"
     }
   ],
   "interface": {

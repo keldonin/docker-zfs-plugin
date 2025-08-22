@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/clinta/go-zfs"
 	"github.com/docker/go-plugins-helpers/volume"
+	"github.com/keldonin/go-zfs"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -36,6 +36,8 @@ const (
 	//To get a root-relative path that we can have access to in the container, we store things under the usual docker volume
 	//path in the host filesystem and mount that path in.
 	volumeBase = "/var/lib/docker/volumes/"
+	// ZFS custom property to control dataset destruction behavior
+	keepProperty = "docker.zfs:keep"
 )
 
 // isSimpleVolumeName checks if the volume name is simple (no '/' characters)
@@ -69,7 +71,7 @@ func buildDatasetName(volumeName string) (string, error) {
 // taking into account ZFS_SHOW_FULL_DATASET setting
 func extractVolumeName(datasetName string) string {
 	showFull := os.Getenv("ZFS_SHOW_FULL_DATASET")
-	if showFull == "1" {
+	if showFull == "1" || strings.ToLower(showFull) == "true" || strings.ToLower(showFull) == "yes" || strings.ToLower(showFull) == "on" {
 		return datasetName
 	}
 
@@ -119,6 +121,89 @@ func (zd *ZfsDriver) volumeExistsInState(volumeName string) bool {
 	}
 
 	return false
+}
+
+// checkDatasetMounted checks if a dataset is currently mounted
+func checkDatasetMounted(datasetName string) (bool, error) {
+	ds, err := zfs.GetDataset(datasetName)
+	if err != nil {
+		return false, err
+	}
+
+	// Get the mounted property to check if dataset is mounted
+	mounted, err := ds.GetProperty("mounted")
+	if err != nil {
+		return false, err
+	}
+
+	return mounted == "yes", nil
+}
+
+// setKeepProperty sets the docker.zfs:keep property on a dataset
+func setKeepProperty(datasetName, value string) error {
+	ds, err := zfs.GetDataset(datasetName)
+	if err != nil {
+		return err
+	}
+
+	return ds.SetProperty(keepProperty, value)
+}
+
+// getKeepProperty gets the docker.zfs:keep property from a dataset
+func getKeepProperty(datasetName string) (string, error) {
+	ds, err := zfs.GetDataset(datasetName)
+	if err != nil {
+		return "", err
+	}
+
+	value, err := ds.GetProperty(keepProperty)
+	if err != nil {
+		// If property doesn't exist, return "off" as default
+		return "off", nil
+	}
+
+	return value, nil
+}
+
+// shouldKeepDataset checks if dataset should be kept based on docker.zfs:keep property
+func shouldKeepDataset(datasetName string) bool {
+	value, err := getKeepProperty(datasetName)
+	if err != nil {
+		return false
+	}
+	return value == "on"
+}
+
+// getDefaultKeepValueForNewDataset returns the default keep value for new datasets
+// based on ZFS_KEEP_NEW_DATASET environment variable
+func getDefaultKeepValueForNewDataset() string {
+	value := strings.ToLower(os.Getenv("ZFS_KEEP_NEW_DATASET"))
+	switch value {
+	case "on", "true", "1", "yes":
+		return "on"
+	case "off", "false", "0", "no", "":
+		return "off"
+	default:
+		log.WithField("ZFS_KEEP_NEW_DATASET", value).Warn("Invalid value for ZFS_KEEP_NEW_DATASET, defaulting to 'off'")
+		return "off"
+	}
+}
+
+// getDefaultKeepValueForExistingDataset returns the default keep value for existing datasets
+// based on ZFS_KEEP_EXISTING_DATASET environment variable
+func getDefaultKeepValueForExistingDataset() string {
+	value := strings.ToLower(os.Getenv("ZFS_KEEP_EXISTING_DATASET"))
+	switch value {
+	case "on", "true", "1", "yes":
+		return "on"
+	case "off", "false", "0", "no":
+		return "off"
+	case "":
+		return "on" // Default behavior: keep existing datasets
+	default:
+		log.WithField("ZFS_KEEP_EXISTING_DATASET", value).Warn("Invalid value for ZFS_KEEP_EXISTING_DATASET, defaulting to 'on'")
+		return "on"
+	}
 }
 
 // NewZfsDriver returns the plugin driver object
@@ -180,30 +265,74 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 		return err
 	}
 
-	if zfs.DatasetExists(datasetName) {
-		return errors.New("volume already exists")
-	}
+	datasetExists := zfs.DatasetExists(datasetName)
 
-	//We unfortunately have to somewhat ignore the mountpath that the user specifies as we're stuck inside a container and
-	//can't access all of the host filesystem that ZFS mounts things relative to. We explicitly mount the volumeBase path into
-	//the container so that we can mount our volumes there with a consistent filepath between the host and the container. Thus
-	//we need to prepend this path to all mountpaths we pass to ZFS itself when it creates the datasets and sets the host
-	//mountpoints. This is needed to ensure that when ZFS on the host re-mounts the dataset (e.g. on boot) it does so in the
-	//right place. To try and play nice we at least use the user-specified mountpath as a sub-path if one was provided.
-	if req.Options == nil {
-		req.Options = make(map[string]string)
-	}
-	mountpoint, explicit := req.Options["mountpoint"]
-	if !explicit {
-		//If we have no explicit mountpoint the default ZFS behaviour is to use the dataset name, so mimic that here.
-		// Use the full dataset name for the mountpoint to maintain consistency across all volumes
-		mountpoint = datasetName
-	}
-	req.Options["mountpoint"] = volumeBase + strings.Trim(mountpoint, "/")
+	if datasetExists {
+		log.WithField("dataset", datasetName).Info("Dataset already exists, checking if it can be attached")
 
-	_, err = zfs.CreateDatasetRecursive(datasetName, req.Options)
-	if err != nil {
-		return err
+		// Check if the dataset is currently mounted
+		mounted, err := checkDatasetMounted(datasetName)
+		if err != nil {
+			log.WithField("dataset", datasetName).WithError(err).Error("Failed to check mount status")
+			return errors.New("failed to check dataset mount status")
+		}
+
+		if mounted {
+			log.WithField("dataset", datasetName).Error("Dataset is already mounted, cannot attach")
+			return errors.New("dataset is already mounted and cannot be attached")
+		}
+
+		// Dataset exists but is not mounted, we can attach it
+		log.WithField("dataset", datasetName).Info("Attaching existing unmounted dataset")
+
+		// Set the keep property based on environment variable ZFS_KEEP_EXISTING_DATASET
+		keepValue := getDefaultKeepValueForExistingDataset()
+		err = setKeepProperty(datasetName, keepValue)
+		if err != nil {
+			log.WithField("dataset", datasetName).WithError(err).Error("Failed to set keep property")
+			return errors.New("failed to set keep property on existing dataset")
+		}
+
+		log.WithField("dataset", datasetName).Infof("Successfully set docker.zfs:keep=%s for attached dataset (based on ZFS_KEEP_EXISTING_DATASET)", keepValue)
+	} else {
+		// Dataset doesn't exist, create it
+		log.WithField("dataset", datasetName).Info("Creating new dataset")
+
+		//We unfortunately have to somewhat ignore the mountpath that the user specifies as we're stuck inside a container and
+		//can't access all of the host filesystem that ZFS mounts things relative to. We explicitly mount the volumeBase path into
+		//the container so that we can mount our volumes there with a consistent filepath between the host and the container. Thus
+		//we need to prepend this path to all mountpaths we pass to ZFS itself when it creates the datasets and sets the host
+		//mountpoints. This is needed to ensure that when ZFS on the host re-mounts the dataset (e.g. on boot) it does so in the
+		//right place. To try and play nice we at least use the user-specified mountpath as a sub-path if one was provided.
+		if req.Options == nil {
+			req.Options = make(map[string]string)
+		}
+		mountpoint, explicit := req.Options["mountpoint"]
+		if !explicit {
+			//If we have no explicit mountpoint the default ZFS behaviour is to use the dataset name, so mimic that here.
+			// Use the full dataset name for the mountpoint to maintain consistency across all volumes
+			mountpoint = datasetName
+		}
+		req.Options["mountpoint"] = volumeBase + strings.Trim(mountpoint, "/")
+
+		// For new datasets to create, we need to set the keep property if it has not been set explicitly through the CLI options
+		_, explicit = req.Options[keepProperty]
+		if !explicit {
+			// Use environment variable ZFS_KEEP_NEW_DATASET to determine default value
+			defaultKeepValue := getDefaultKeepValueForNewDataset()
+			req.Options[keepProperty] = defaultKeepValue
+			log.WithField("dataset", datasetName).Infof("No keep property specified, using default from ZFS_KEEP_NEW_DATASET: docker.zfs:keep=%s", defaultKeepValue)
+		} else {
+			log.WithField("dataset", datasetName).Infof("Using user-specified keep property: %s=%s", keepProperty, req.Options[keepProperty])
+		}
+
+		_, err = zfs.CreateDatasetRecursive(datasetName, req.Options)
+		if err != nil {
+			log.WithField("dataset", datasetName).WithError(err).Error("Failed to create dataset")
+			return err
+		}
+
+		log.WithField("dataset", datasetName).Info("Successfully created new dataset")
 	}
 
 	// Store the original volume name in our tracking map, not the full dataset name
@@ -211,7 +340,7 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 
 	zd.saveDatasetState()
 
-	return err
+	return nil
 }
 
 // List returns a list of zfs volumes on this host
@@ -326,10 +455,27 @@ func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 		return err
 	}
 
+	// Check if dataset should be kept based on docker.zfs:keep property
+	if shouldKeepDataset(datasetName) {
+		log.WithField("dataset", datasetName).Info("Dataset has docker.zfs:keep=on, preserving dataset and only removing from Docker volume tracking")
+
+		// Remove from our tracking but don't destroy the dataset
+		delete(zd.volumes, req.Name)
+		zd.saveDatasetState()
+
+		log.WithField("dataset", datasetName).Info("Successfully removed volume from tracking while preserving dataset")
+		return nil
+	}
+
+	log.WithField("dataset", datasetName).Info("Dataset has docker.zfs:keep=off or not set, destroying dataset")
+
 	err = ds.Destroy()
 	if err != nil {
+		log.WithField("dataset", datasetName).WithError(err).Error("Failed to destroy dataset")
 		return err
 	}
+
+	log.WithField("dataset", datasetName).Info("Successfully destroyed dataset")
 
 	// Remove using the original volume name
 	delete(zd.volumes, req.Name)

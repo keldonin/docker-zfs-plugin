@@ -3,9 +3,9 @@ module github.com/keldonin/docker-zfs-plugin
 go 1.23.5
 
 require (
-	github.com/clinta/go-zfs v0.0.0-20181025145938-e5fe14d9dcb7
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/docker/go-plugins-helpers v0.0.0-20240701071450-45e2431495c8
+	github.com/keldonin/go-zfs v0.0.0-20250822071729-62687e836101
 	github.com/sirupsen/logrus v1.9.3
 )
 
