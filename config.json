@@ -21,14 +21,6 @@
       ]
     },
     {
-      "name": "ZFS_SHOW_FULL_DATASET",
-      "description": "Show the full dataset name (including parent dataset)",
-      "settable": [
-        "value"
-      ],
-      "value": "on"
-    },
-    {
       "name": "ZFS_KEEP_NEW_DATASET",
       "description": "Default docker.zfs:keep value for newly created datasets (on/off)",
       "settable": [

@@ -67,60 +67,18 @@ func buildDatasetName(volumeName string) (string, error) {
 	return volumeName, nil
 }
 
-// extractVolumeName extracts the volume name for display from a dataset name
-// taking into account ZFS_SHOW_FULL_DATASET setting
-func extractVolumeName(datasetName string) string {
-	showFull := os.Getenv("ZFS_SHOW_FULL_DATASET")
-	if showFull == "1" || strings.ToLower(showFull) == "true" || strings.ToLower(showFull) == "yes" || strings.ToLower(showFull) == "on" {
-		return datasetName
-	}
 
-	parentDataset := os.Getenv("ZFS_PARENT_DATASET")
-	if parentDataset != "" && strings.HasPrefix(datasetName, parentDataset+"/") {
-		return strings.TrimPrefix(datasetName, parentDataset+"/")
-	}
-	return datasetName
-}
-
-// getDisplayName returns the appropriate display name for a volume
-func getDisplayName(volumeName string) (string, error) {
-	// First, get the actual dataset name
-	datasetName, err := buildDatasetName(volumeName)
-	if err != nil {
-		return volumeName, err // fallback to original name if we can't build dataset name
-	}
-
-	// Then apply display logic based on ZFS_SHOW_FULL_DATASET
-	return extractVolumeName(datasetName), nil
-}
 
 // volumeExistsInState checks if a volume already exists in our internal state
-// considering both short and long names to prevent duplicates
 func (zd *ZfsDriver) volumeExistsInState(volumeName string) bool {
-	// Check if volume exists with the exact name
-	if _, exists := zd.volumes[volumeName]; exists {
-		return true
+	// Build the full dataset name and check if it exists in state
+	datasetName, err := buildDatasetName(volumeName)
+	if err != nil {
+		return false
 	}
-
-	// If it's a simple name, check if the full dataset name exists
-	if isSimpleVolumeName(volumeName) {
-		if parentDataset := os.Getenv("ZFS_PARENT_DATASET"); parentDataset != "" {
-			fullName := parentDataset + "/" + volumeName
-			if _, exists := zd.volumes[fullName]; exists {
-				return true
-			}
-		}
-	} else {
-		// If it's a full name, check if the short name exists
-		shortName := extractVolumeName(volumeName)
-		if shortName != volumeName {
-			if _, exists := zd.volumes[shortName]; exists {
-				return true
-			}
-		}
-	}
-
-	return false
+	
+	_, exists := zd.volumes[datasetName]
+	return exists
 }
 
 // checkDatasetMounted checks if a dataset is currently mounted
@@ -335,8 +293,8 @@ func (zd *ZfsDriver) Create(req *volume.CreateRequest) error {
 		log.WithField("dataset", datasetName).Info("Successfully created new dataset")
 	}
 
-	// Store the original volume name in our tracking map, not the full dataset name
-	zd.volumes[req.Name] = struct{}{}
+	// Store the dataset name in our tracking map
+	zd.volumes[datasetName] = struct{}{}
 
 	zd.saveDatasetState()
 
@@ -399,22 +357,15 @@ func (zd *ZfsDriver) getVolume(name string) (*volume.Volume, error) {
 	//Need to scope the host path for the container before returning to docker
 	mp = zd.scopeMount(mp)
 
-	// Get the appropriate display name for the volume
-	displayName, err := getDisplayName(name)
-	if err != nil {
-		log.WithError(err).Error("Failed to get display name")
-		displayName = name // fallback to original name
-	}
-
 	ts, err := ds.GetCreation()
 	if err != nil {
 		log.WithError(err).Error("Failed to get creation property from zfs dataset")
-		// Return the display name for the volume
-		return &volume.Volume{Name: displayName, Mountpoint: mp}, nil
+		// Return the full dataset name for the volume
+		return &volume.Volume{Name: datasetName, Mountpoint: mp}, nil
 	}
 
-	// Return the display name for the volume
-	return &volume.Volume{Name: displayName, Mountpoint: mp, CreatedAt: ts.Format(time.RFC3339)}, nil
+	// Return the full dataset name for the volume
+	return &volume.Volume{Name: datasetName, Mountpoint: mp, CreatedAt: ts.Format(time.RFC3339)}, nil
 }
 
 func (zd *ZfsDriver) getMP(name string) (string, error) {
@@ -460,7 +411,7 @@ func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 		log.WithField("dataset", datasetName).Info("Dataset has docker.zfs:keep=on, preserving dataset and only removing from Docker volume tracking")
 
 		// Remove from our tracking but don't destroy the dataset
-		delete(zd.volumes, req.Name)
+		delete(zd.volumes, datasetName)
 		zd.saveDatasetState()
 
 		log.WithField("dataset", datasetName).Info("Successfully removed volume from tracking while preserving dataset")
@@ -477,8 +428,8 @@ func (zd *ZfsDriver) Remove(req *volume.RemoveRequest) error {
 
 	log.WithField("dataset", datasetName).Info("Successfully destroyed dataset")
 
-	// Remove using the original volume name
-	delete(zd.volumes, req.Name)
+	// Remove using the full dataset name
+	delete(zd.volumes, datasetName)
 
 	zd.saveDatasetState()
 
